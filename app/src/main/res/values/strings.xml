@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PadTube</string>
+    <string name="music_app_name">PadMusic 音乐</string>
+    <string name="playback_channel_name">音乐播放</string>
+    <string name="playback_channel_description">锁屏和后台播放控制</string>
+</resources>

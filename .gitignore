@@ -1,0 +1,20 @@
+# Local toolchain and machine-specific paths
+.android-sdk/
+.tooling/
+local.properties
+
+# Gradle / Kotlin / Android Studio output
+.gradle/
+.kotlin/
+.idea/
+*.iml
+build/
+
+# Built APKs and device screenshots (too large for version control)
+release/
+artifacts/
+
+# Signing secrets: losing these blocks upgrades, committing them leaks them
+keystore.properties
+*.jks
+*.keystore

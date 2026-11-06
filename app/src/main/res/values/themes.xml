@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PadTube" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowBackground">#0B0B0E</item>
+        <item name="android:navigationBarColor">#0B0B0E</item>
+        <item name="android:statusBarColor">#101014</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#FF3347</item>
+    </style>
+
+    <style name="Theme.PadMusic" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:windowBackground">#09090B</item>
+        <item name="android:navigationBarColor">#09090B</item>
+        <item name="android:statusBarColor">#101014</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:colorAccent">#FF1744</item>
+    </style>
+</resources>
