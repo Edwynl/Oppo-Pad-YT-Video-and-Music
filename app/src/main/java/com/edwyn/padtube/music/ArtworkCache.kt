@@ -16,6 +16,12 @@ object ArtworkCache {
     private var cachedUrl: String? = null
     private var cachedBitmap: Bitmap? = null
 
+    internal fun sampleSizeFor(width: Int, height: Int, maxDimension: Int): Int {
+        var sampleSize = 1
+        while (maxOf(width, height) / sampleSize > maxDimension) sampleSize *= 2
+        return sampleSize
+    }
+
     fun get(url: String?): Bitmap? {
         if (url.isNullOrBlank()) return null
         synchronized(lock) {
@@ -33,7 +39,7 @@ object ArtworkCache {
                 doInput = true
             }
             try {
-                connection.inputStream.use { BitmapFactory.decodeStream(it) }
+                decode(connection.inputStream.use { it.readBytes() })
             } finally {
                 connection.disconnect()
             }
@@ -44,4 +50,15 @@ object ArtworkCache {
         }
         return bitmap
     }
+
+    private fun decode(bytes: ByteArray): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        val options = BitmapFactory.Options().apply {
+            inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, MAX_DIMENSION)
+        }
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    }
+
+    private const val MAX_DIMENSION = 1024
 }

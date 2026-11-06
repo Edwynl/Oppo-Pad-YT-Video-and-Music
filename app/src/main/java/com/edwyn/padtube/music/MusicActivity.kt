@@ -6,10 +6,14 @@ import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.JsResult
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -33,6 +37,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -56,6 +61,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -75,7 +82,11 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.edwyn.padtube.AdBlocker
 import com.edwyn.padtube.BuildConfig
+import com.edwyn.padtube.ExternalLinkPolicy
+import com.edwyn.padtube.LinkAction
+import com.edwyn.padtube.PlaybackService
 import com.edwyn.padtube.R
+import com.edwyn.padtube.RendererRecovery
 import androidx.webkit.UserAgentMetadata
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
@@ -90,6 +101,15 @@ class MusicActivity : ComponentActivity() {
     private var browserViewModel: BrowserViewModel? = null
     private var customView: View? = null
     private var customViewCallback: WebChromeClient.CustomViewCallback? = null
+    private var mediaPlaying = false
+    private var webViewGeneration by mutableIntStateOf(0)
+    private var lastUrl: String? = null
+    private var recoveryUrl: String? = null
+    private var lastRecoveryAt: Long? = null
+    private var inForeground = false
+    private val idleHandler = Handler(Looper.getMainLooper())
+    private val pauseWebViewWhenIdle = Runnable { webView?.onPause() }
+    private val stopServiceWhenIdle = Runnable { MusicPlaybackService.stop(applicationContext) }
 
     private val playbackHandler = PlaybackCommandHandler { command ->
         runOnUiThread { executePlaybackCommand(command) }
@@ -112,11 +132,18 @@ class MusicActivity : ComponentActivity() {
                 PadMusicTheme {
                     PadMusicScreen(
                         uiState = uiState,
+                        webViewGeneration = webViewGeneration,
                         webViewFactory = { createWebView(savedInstanceState) },
                         onBack = { webView?.goBack() },
                         onForward = { webView?.goForward() },
-                        onHome = { webView?.loadUrl(MUSIC_HOME) },
-                        onRefresh = { webView?.reload() },
+                        onHome = {
+                            vm.onRetry()
+                            webView?.loadUrl(MUSIC_HOME)
+                        },
+                        onRefresh = {
+                            vm.onRetry()
+                            webView?.reload()
+                        },
                         onVideo = { executePlaybackCommand(PlaybackCommand.VIDEO) },
                         onOpenInChrome = { openAccountMode(webView?.url ?: MUSIC_HOME) },
                         onRetry = {
@@ -142,6 +169,8 @@ class MusicActivity : ComponentActivity() {
                 when {
                     customView != null -> exitFullscreen()
                     webView?.canGoBack() == true -> webView?.goBack()
+                    // finish() would stop the music; keep it playing in the background.
+                    mediaPlaying -> moveTaskToBack(true)
                     else -> finish()
                 }
             }
@@ -242,9 +271,29 @@ class MusicActivity : ComponentActivity() {
                     view: WebView,
                     request: WebResourceRequest
                 ): Boolean {
-                    val url = request.url.toString()
-                    if (NavigationPolicy.isAllowed(url)) return false
-                    openExternal(url)
+                    val uri = request.url
+                    val action = ExternalLinkPolicy.actionFor(
+                        scheme = uri.scheme,
+                        allowedHost = NavigationPolicy.isAllowed(uri.scheme, uri.host),
+                        isMainFrame = request.isForMainFrame,
+                        hasGesture = request.hasGesture(),
+                        isRedirect = request.isRedirect
+                    )
+                    when (action) {
+                        LinkAction.STAY_IN_APP -> return false
+                        LinkAction.OPEN_EXTERNALLY -> openExternal(uri.toString())
+                        LinkAction.BLOCK -> browserViewModel?.showMessage("已阻止打开此链接")
+                    }
+                    return true
+                }
+
+                // By default a dead renderer takes the whole app down, stopping
+                // any playback; replace just the WebView instead.
+                override fun onRenderProcessGone(
+                    view: WebView,
+                    detail: RenderProcessGoneDetail
+                ): Boolean {
+                    recoverFromRendererGone(view)
                     return true
                 }
 
@@ -264,7 +313,15 @@ class MusicActivity : ComponentActivity() {
                 }
 
                 override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                    lastUrl = url ?: lastUrl
+                    browserViewModel?.onNavigationStarted(url)
                     updateBrowserState(view, 0)
+                }
+
+                // YouTube Music navigates with history.pushState, which skips
+                // onPageStarted; track the URL so recovery returns to this page.
+                override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                    lastUrl = url ?: lastUrl
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
@@ -280,7 +337,7 @@ class MusicActivity : ComponentActivity() {
                     error: WebResourceError
                 ) {
                     if (request.isForMainFrame) {
-                        browserViewModel?.onLoadError()
+                        browserViewModel?.onLoadError(request.url.toString())
                     }
                 }
             }
@@ -315,10 +372,35 @@ class MusicActivity : ComponentActivity() {
                 }
             }
 
-            if (savedInstanceState == null || restoreState(savedInstanceState) == null) {
-                loadUrl(MUSIC_HOME)
+            val pendingRecovery = recoveryUrl
+            recoveryUrl = null
+            when {
+                pendingRecovery != null -> loadUrl(pendingRecovery)
+                savedInstanceState == null || restoreState(savedInstanceState) == null ->
+                    loadUrl(MUSIC_HOME)
             }
         }
+    }
+
+    /**
+     * The dead WebView accepts no further calls: drop it and let Compose build a
+     * new one. Compose is paused while the activity is stopped, so a renderer
+     * killed for memory in the background reloads only when the user returns.
+     */
+    private fun recoverFromRendererGone(deadView: WebView) {
+        val now = SystemClock.elapsedRealtime()
+        recoveryUrl = RendererRecovery.urlAfterCrash(lastUrl, MUSIC_HOME, lastRecoveryAt, now)
+        lastRecoveryAt = now
+        exitFullscreen(notifyPage = false)
+        webView = null
+        (deadView.parent as? ViewGroup)?.removeView(deadView)
+        deadView.destroy()
+        mediaPlaying = false
+        updateIdleTimer()
+        // Show as paused (and release the wake lock) until the new page reports in.
+        MusicPlaybackService.update(applicationContext, "", "", "", false, 0, 0)
+        webViewGeneration++
+        browserViewModel?.showMessage("页面进程已退出，已重新加载")
     }
 
     /** Handles a JSON media-state message posted by [MusicCleaner] (main thread). */
@@ -328,6 +410,11 @@ class MusicActivity : ComponentActivity() {
         val artist = state.optString("artist").replace(WHITESPACE, " ").trim().take(180)
         val artwork = state.optString("artwork").trim()
         val playing = state.optBoolean("playing")
+        val wasPlaying = mediaPlaying
+        mediaPlaying = playing
+        // The two launcher icons share one speaker: only one plays at a time.
+        if (playing && !wasPlaying) PlaybackService.commandHandler?.invoke(false)
+        if (playing != wasPlaying) updateIdleTimer()
         val positionSeconds = state.optDouble("position", 0.0).takeIf { it.isFinite() } ?: 0.0
         val durationSeconds = state.optDouble("duration", 0.0).takeIf { it.isFinite() } ?: 0.0
         MusicPlaybackService.update(
@@ -341,7 +428,23 @@ class MusicActivity : ComponentActivity() {
         )
     }
 
+    /**
+     * Idle in the background: pause the WebView to save battery, but not at once,
+     * since the page reports "not playing" briefly between tracks. Later, release
+     * the notification too.
+     */
+    private fun updateIdleTimer() {
+        idleHandler.removeCallbacks(pauseWebViewWhenIdle)
+        idleHandler.removeCallbacks(stopServiceWhenIdle)
+        if (!mediaPlaying && !inForeground) {
+            idleHandler.postDelayed(pauseWebViewWhenIdle, IDLE_PAUSE_WEBVIEW_MS)
+            idleHandler.postDelayed(stopServiceWhenIdle, IDLE_STOP_MS)
+        }
+    }
+
     private fun executePlaybackCommand(command: PlaybackCommand) {
+        // The WebView may be paused after idling in the background.
+        if (command != PlaybackCommand.PAUSE) webView?.onResume()
         val jsCommand = when (command) {
             PlaybackCommand.PLAY -> "play"
             PlaybackCommand.PAUSE -> "pause"
@@ -372,9 +475,13 @@ class MusicActivity : ComponentActivity() {
     }
 
     private fun openExternal(url: String) {
+        val intent = Intent(Intent.ACTION_VIEW, url.toUri())
+            .addCategory(Intent.CATEGORY_BROWSABLE)
         try {
-            startActivity(Intent(Intent.ACTION_VIEW, url.toUri()))
+            startActivity(intent)
         } catch (_: ActivityNotFoundException) {
+            browserViewModel?.showMessage("没有找到可打开此链接的应用")
+        } catch (_: SecurityException) {
             browserViewModel?.showMessage("没有找到可打开此链接的应用")
         }
     }
@@ -429,12 +536,12 @@ class MusicActivity : ComponentActivity() {
         }
     }
 
-    private fun exitFullscreen() {
+    private fun exitFullscreen(notifyPage: Boolean = true) {
         val view = customView ?: return
         root.removeView(view)
         customView = null
         composeView.visibility = View.VISIBLE
-        customViewCallback?.onCustomViewHidden()
+        if (notifyPage) customViewCallback?.onCustomViewHidden()
         customViewCallback = null
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         WindowCompat.getInsetsController(window, root).show(WindowInsetsCompat.Type.systemBars())
@@ -446,11 +553,25 @@ class MusicActivity : ComponentActivity() {
     }
 
     override fun onPause() {
-        // Deliberately do not call WebView.onPause(): audio must continue with screen off.
+        // Persist the session now: the process may be killed while in the background.
+        CookieManager.getInstance().flush()
+        // Do not call WebView.onPause() here: audio must continue with the screen
+        // off. updateIdleTimer pauses it only if nothing is playing.
+        inForeground = false
+        updateIdleTimer()
         super.onPause()
     }
 
+    override fun onResume() {
+        super.onResume()
+        webView?.onResume()
+        inForeground = true
+        updateIdleTimer()
+    }
+
     override fun onDestroy() {
+        idleHandler.removeCallbacks(pauseWebViewWhenIdle)
+        idleHandler.removeCallbacks(stopServiceWhenIdle)
         PlaybackBridge.detach(playbackHandler)
         MusicPlaybackService.stop(applicationContext)
         customView?.let(root::removeView)
@@ -470,6 +591,8 @@ class MusicActivity : ComponentActivity() {
         private val MUSIC_ORIGINS = setOf("https://music.youtube.com")
         private const val CHROME_PACKAGE = "com.android.chrome"
         private const val FALLBACK_CHROME_MAJOR = "150"
+        private const val IDLE_PAUSE_WEBVIEW_MS = 30 * 1000L
+        private const val IDLE_STOP_MS = 10 * 60 * 1000L
         private val WHITESPACE = Regex("\\s+")
 
         // Claim the same Chrome major version the installed WebView runs, so
@@ -532,6 +655,7 @@ private fun PadMusicTheme(content: @Composable () -> Unit) {
 @Composable
 private fun PadMusicScreen(
     uiState: MusicUiState,
+    webViewGeneration: Int,
     webViewFactory: () -> WebView,
     onBack: () -> Unit,
     onForward: () -> Unit,
@@ -555,6 +679,7 @@ private fun PadMusicScreen(
             .background(MaterialTheme.colorScheme.background)
             .statusBarsPadding()
             .navigationBarsPadding()
+            .imePadding()
     ) {
         Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 3.dp) {
             Column {
@@ -585,7 +710,9 @@ private fun PadMusicScreen(
         }
 
         Box(modifier = Modifier.weight(1f)) {
-            AndroidView(factory = { webViewFactory() }, modifier = Modifier.fillMaxSize())
+            key(webViewGeneration) {
+                AndroidView(factory = { webViewFactory() }, modifier = Modifier.fillMaxSize())
+            }
 
             if (!uiState.firstLoadComplete && !uiState.hasError) {
                 LoadingPlaceholder()

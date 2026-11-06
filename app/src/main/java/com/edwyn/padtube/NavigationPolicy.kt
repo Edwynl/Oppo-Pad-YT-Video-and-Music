@@ -14,9 +14,19 @@ object NavigationPolicy {
 
     fun isAllowed(rawUrl: String): Boolean {
         val uri = runCatching { URI(rawUrl) }.getOrNull() ?: return false
-        if (uri.scheme != "http" && uri.scheme != "https") return false
-        val host = uri.host?.lowercase() ?: return false
-        return allowedHosts.any { host == it || host.endsWith(".$it") }
+        return isAllowed(uri.scheme, uri.host)
+    }
+
+    fun isAllowed(scheme: String?, host: String?): Boolean {
+        if (scheme != "http" && scheme != "https") return false
+        val normalizedHost = host?.lowercase() ?: return false
+        return allowedHosts.any { normalizedHost == it || normalizedHost.endsWith(".$it") }
+    }
+
+    /** The hosts YouTubeCleaner is written for; other allowed hosts must not receive it. */
+    fun isYouTubeHost(host: String?): Boolean = when (host?.lowercase()) {
+        "www.youtube.com", "m.youtube.com" -> true
+        else -> false
     }
 
     fun isGoogleSignIn(rawUrl: String): Boolean {

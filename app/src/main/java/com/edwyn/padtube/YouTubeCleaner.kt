@@ -4,6 +4,9 @@ object YouTubeCleaner {
     val script = """
         (() => {
           'use strict';
+          // Document-start injection also reaches same-origin iframes (live
+          // chat); only the top page needs cleaning.
+          if (window !== window.top) return;
           const VERSION = '1.6.0';
           if (window.__padTubeCleaner === VERSION) {
             window.__padTubeCleanNow?.();
@@ -143,6 +146,26 @@ object YouTubeCleaner {
             });
           }
 
+          // YouTube ignores script clicks on the skip button, which leaves the
+          // end card some ads show after their video sitting for ~7s. Ask the
+          // app for a real tap instead, but only when the button is what a
+          // finger at its centre would hit, so a tap never lands on the ad.
+          let lastTapAt = 0;
+          function requestNativeTap(el) {
+            if (!window.padtubeTap || Date.now() - lastTapAt < 1000) return;
+            const r = el.getBoundingClientRect();
+            const x = r.left + r.width / 2;
+            const y = r.top + r.height / 2;
+            const hit = document.elementFromPoint(x, y);
+            if (!hit || !el.contains(hit)) return;
+            const vv = window.visualViewport;
+            const fx = (x - vv.offsetLeft) / vv.width;
+            const fy = (y - vv.offsetTop) / vv.height;
+            if (!(fx >= 0 && fx <= 1 && fy >= 0 && fy <= 1)) return;
+            lastTapAt = Date.now();
+            window.padtubeTap.postMessage(fx.toFixed(4) + ',' + fy.toFixed(4));
+          }
+
           function handlePlayerAd() {
             const player = document.querySelector('.html5-video-player, #movie_player');
             const video = document.querySelector('video');
@@ -174,6 +197,7 @@ object YouTubeCleaner {
                      al.includes('跳过') || (txt.includes('跳过') && txt.length < 10)) &&
                     visible(el)) {
                   try { el.click(); } catch (_) {}
+                  requestNativeTap(el);
                 }
               });
             } else if (adMode && video) {
@@ -194,6 +218,7 @@ object YouTubeCleaner {
           }
 
           function cleanNow() {
+            watchPlayer();
             removeAdUi();
             handlePlayerAd();
             autoUnmute();
@@ -232,13 +257,34 @@ object YouTubeCleaner {
           }
 
           window.__padTubeCleanNow = cleanNow;
+
+          // New elements anywhere (feed ads, dialogs) or class changes inside
+          // the player (ad-showing, unmute popup) trigger a pass; hover and
+          // other class changes across the rest of the page do not.
           new MutationObserver(scheduleClean).observe(document.documentElement, {
             childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class']
+            subtree: true
           });
-          setInterval(cleanNow, 500);
+          const playerObserver = new MutationObserver(scheduleClean);
+          let watchedPlayer = null;
+          function watchPlayer() {
+            const player = document.querySelector('.html5-video-player, #movie_player');
+            if (!player || player === watchedPlayer) return;
+            watchedPlayer = player;
+            playerObserver.disconnect();
+            playerObserver.observe(player, {
+              attributes: true,
+              attributeFilter: ['class'],
+              subtree: true
+            });
+          }
+
+          // Safety net for anything the observers miss: every 3s, or every
+          // tick while an ad is being skipped.
+          let ticks = 0;
+          setInterval(() => {
+            if (adMode || ++ticks % 6 === 0) cleanNow();
+          }, 500);
           document.addEventListener('yt-navigate-finish', cleanNow, true);
           cleanNow();
         })();

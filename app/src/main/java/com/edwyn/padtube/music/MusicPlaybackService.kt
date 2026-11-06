@@ -5,20 +5,23 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.media.AudioManager
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
-import android.os.PowerManager
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
 import androidx.media.session.MediaButtonReceiver.handleIntent
+import com.edwyn.padtube.PlaybackLocks
 import com.edwyn.padtube.R
 import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
@@ -26,7 +29,8 @@ import android.support.v4.media.session.PlaybackStateCompat
 
 class MusicPlaybackService : Service() {
     private lateinit var mediaSession: MediaSessionCompat
-    private var wakeLock: PowerManager.WakeLock? = null
+    private lateinit var locks: PlaybackLocks
+    private var inForeground = false
     private val mainHandler = Handler(Looper.getMainLooper())
     private var title: String = "YouTube Music"
     private var artist: String = "PadMusic"
@@ -37,9 +41,23 @@ class MusicPlaybackService : Service() {
     private var durationMs: Long = 0
     private var isPlaying: Boolean = false
 
+    // Headphones unplugged or Bluetooth lost: stop rather than switch to the speaker.
+    private val noisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (isPlaying) PlaybackBridge.dispatch(PlaybackCommand.PAUSE)
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         running = true
+        locks = PlaybackLocks(this, "PadMusic")
+        ContextCompat.registerReceiver(
+            this,
+            noisyReceiver,
+            IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         createNotificationChannel()
         mediaSession = MediaSessionCompat(this, "PadMusicSession").apply {
             setSessionActivity(contentPendingIntent())
@@ -61,6 +79,7 @@ class MusicPlaybackService : Service() {
             return START_NOT_STICKY
         }
 
+        val contentBefore = displayedContent()
         when (intent?.action) {
             ACTION_UPDATE -> {
                 title = intent.getStringExtra(EXTRA_TITLE)?.take(180).orEmpty()
@@ -83,36 +102,48 @@ class MusicPlaybackService : Service() {
         }
 
         ensureArtwork()
-        updateMediaSession()
-        updateWakeLock()
-        showForegroundNotification()
+        updatePlaybackState()
+        locks.update(isPlaying)
+        // Position pings arrive every few seconds and only need the playback
+        // state; rebuild metadata and the notification when something visible
+        // changes. The first pass must still call startForeground.
+        if (!inForeground || displayedContent() != contentBefore) {
+            updateMetadata()
+            showForegroundNotification()
+            inForeground = true
+        }
         return START_NOT_STICKY
     }
+
+    private fun displayedContent() = listOf(title, artist, artworkUrl, durationMs, isPlaying)
 
     /** Resolve the cover bitmap for the current track, loading it off the main thread. */
     private fun ensureArtwork() {
         if (artworkUrl == loadedArtworkUrl) return
         loadedArtworkUrl = artworkUrl
-        val cached = ArtworkCache.get(artworkUrl)
-        if (cached != null || artworkUrl.isBlank()) {
-            artwork = cached
-            return
-        }
+        // Drop the previous track's cover now so a failed download cannot leave
+        // it on screen under the new title.
+        artwork = ArtworkCache.get(artworkUrl)
+        if (artwork != null || artworkUrl.isBlank()) return
         val requestedUrl = artworkUrl
         Thread {
             val bitmap = ArtworkCache.load(requestedUrl)
             mainHandler.post {
                 // Ignore if the track changed while we were downloading.
-                if (running && requestedUrl == artworkUrl && bitmap != null) {
-                    artwork = bitmap
-                    updateMediaSession()
-                    showForegroundNotification()
+                if (!running || requestedUrl != artworkUrl) return@post
+                if (bitmap == null) {
+                    // Let the next update from the page try again.
+                    loadedArtworkUrl = ""
+                    return@post
                 }
+                artwork = bitmap
+                updateMetadata()
+                showForegroundNotification()
             }
         }.start()
     }
 
-    private fun updateMediaSession() {
+    private fun updateMetadata() {
         mediaSession.setMetadata(
             MediaMetadataCompat.Builder()
                 .putString(MediaMetadataCompat.METADATA_KEY_TITLE, title)
@@ -126,7 +157,9 @@ class MusicPlaybackService : Service() {
                 }
                 .build()
         )
+    }
 
+    private fun updatePlaybackState() {
         val state = if (isPlaying) {
             PlaybackStateCompat.STATE_PLAYING
         } else {
@@ -207,23 +240,6 @@ class MusicPlaybackService : Service() {
             .build()
     }
 
-    private fun updateWakeLock() {
-        if (isPlaying) {
-            if (wakeLock?.isHeld != true) {
-                wakeLock = (getSystemService(POWER_SERVICE) as PowerManager)
-                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "PadMusic:Playback")
-                    .apply { acquire(8 * 60 * 60 * 1000L) }
-            }
-        } else {
-            releaseWakeLock()
-        }
-    }
-
-    private fun releaseWakeLock() {
-        wakeLock?.let { if (it.isHeld) it.release() }
-        wakeLock = null
-    }
-
     private fun contentPendingIntent(): PendingIntent {
         val intent = Intent(this, MusicActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -263,7 +279,7 @@ class MusicPlaybackService : Service() {
 
     private fun stopPlayback() {
         PlaybackBridge.dispatch(PlaybackCommand.PAUSE)
-        releaseWakeLock()
+        locks.release()
         mediaSession.isActive = false
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -272,7 +288,8 @@ class MusicPlaybackService : Service() {
     override fun onDestroy() {
         running = false
         mainHandler.removeCallbacksAndMessages(null)
-        releaseWakeLock()
+        unregisterReceiver(noisyReceiver)
+        locks.release()
         mediaSession.isActive = false
         mediaSession.release()
         super.onDestroy()
@@ -338,10 +355,17 @@ class MusicPlaybackService : Service() {
                 putExtra(EXTRA_DURATION, durationMs)
                 putExtra(EXTRA_PLAYING, playing)
             }
-            if (running) {
-                context.startService(intent)
-            } else {
-                ContextCompat.startForegroundService(context, intent)
+            // Android 12+ refuses to start a foreground service from the
+            // background (e.g. playback began just after leaving the app). The
+            // page reports again every second, so a later update retries once
+            // the app is back in the foreground.
+            try {
+                if (running) {
+                    context.startService(intent)
+                } else {
+                    ContextCompat.startForegroundService(context, intent)
+                }
+            } catch (_: IllegalStateException) {
             }
         }
 

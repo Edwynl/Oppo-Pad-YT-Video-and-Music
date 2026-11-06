@@ -5,14 +5,18 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
 import android.os.IBinder
+import androidx.core.content.ContextCompat
 
 /**
  * Keeps PadTube alive while a video plays with the screen locked or the app in
@@ -22,9 +26,24 @@ import android.os.IBinder
  */
 class PlaybackService : Service() {
     private lateinit var session: MediaSession
+    private lateinit var locks: PlaybackLocks
+
+    // Headphones unplugged or Bluetooth lost: stop rather than switch to the speaker.
+    private val noisyReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (playing) commandHandler?.invoke(false)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
+        locks = PlaybackLocks(this, "PadTube")
+        ContextCompat.registerReceiver(
+            this,
+            noisyReceiver,
+            IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "播放控制", NotificationManager.IMPORTANCE_LOW).apply {
@@ -50,6 +69,7 @@ class PlaybackService : Service() {
             }
         }
         updateSession()
+        locks.update(playing)
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
@@ -121,6 +141,8 @@ class PlaybackService : Service() {
     }
 
     override fun onDestroy() {
+        unregisterReceiver(noisyReceiver)
+        locks.release()
         session.release()
         super.onDestroy()
     }

@@ -8,12 +8,15 @@ object MediaBridge {
     /** Reports {"playing":bool,"title":string} whenever either changes. */
     val reportScript = """
         (() => {
-          if (window.__padTubeMedia || !window.$LISTENER_NAME) return;
+          if (window !== window.top || window.__padTubeMedia || !window.$LISTENER_NAME) return;
           window.__padTubeMedia = true;
           let last = '';
           function report() {
             const v = document.querySelector('#movie_player video') || document.querySelector('video');
-            const playing = !!v && !v.paused && !v.ended;
+            // A muted video is a feed preview, not playback. Ads count even
+            // though the cleaner mutes them: the watched video resumes after.
+            const inAd = !!v && !!v.closest('.ad-showing, .ad-interrupting');
+            const playing = !!v && !v.paused && !v.ended && (!v.muted || inAd);
             const title = (document.title || '')
               .replace(/^\(\d+\)\s*/, '')
               .replace(/\s*-\s*YouTube$/, '');
@@ -26,7 +29,7 @@ object MediaBridge {
           // Media events do not bubble, so listen in the capture phase.
           // timeupdate (~4/s) catches the page title changing after playback
           // starts; unchanged state is deduplicated above and never posted.
-          ['play', 'playing', 'pause', 'ended', 'emptied', 'timeupdate'].forEach(e =>
+          ['play', 'playing', 'pause', 'ended', 'emptied', 'timeupdate', 'volumechange'].forEach(e =>
             document.addEventListener(e, report, true));
           document.addEventListener('yt-navigate-finish', report, true);
         })();

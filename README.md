@@ -28,6 +28,41 @@ PadTube 是参考仓库根目录的 YouTube Clear 桌面版，为 Android 平板
 - 固定复用同一个系统浏览器，避免不同浏览器之间登录状态不互通
 - 应用进入后台或退出时主动持久化 WebView Cookie
 
+## 1.7.4 广告结束卡片
+
+- 部分广告播完后会显示带“跳过”按钮的结束卡片，YouTube 不响应脚本点击，之前每次要等约 7 秒。现在由 App 在跳过按钮上模拟一次真实触摸，立即关闭
+- 只有按钮位于触摸点最上层时才会触摸，不会点到广告本身；最快约 1 秒一次
+- 仅 PadTube；PadMusic 未改动
+
+## 1.7.3 耗电与播放体验
+
+- 暂停后留在后台：PadMusic 30 秒后暂停网页，PadTube 仍是立即暂停；两者 10 分钟后都会关闭通知和服务，回到 App 后可继续播放
+- PadTube 和 PadMusic 不再同时出声，一个开始播放时另一个自动暂停（电话等其他 App 的音频焦点尚未处理）
+- 拔出耳机或断开蓝牙时自动暂停，不再转为外放
+- 播放时保持 CPU 和 Wi-Fi 唤醒，暂停时释放，减少锁屏卡顿（PadTube 新增，PadMusic 增加 Wi-Fi）
+- 清理脚本只响应新元素和播放器内的变化，兜底定时器从每 0.5 秒改为约 3 秒一次，跳广告时才高频运行
+- 通知栏只在歌曲信息或播放状态变化时刷新
+- 信息流里静音自动播放的预览不再被当作正在播放；静音观看的视频切到后台也会暂停
+- 加载失败的提示不再被后续加载进度清掉；重试、刷新、回首页或打开其他页面时才消失
+- 输入时键盘不再遮挡页面；修改显示大小或字体大小不再中断播放
+
+## 1.7.2 行为修复
+
+- 播放中在根页面按返回键，改为退到后台继续播放；没有播放时仍正常退出
+- 清理脚本只在 YouTube 页面的顶层框架运行，不再进入 Google 登录页和直播聊天等 iframe
+- 恢复页面失败时回到首页，不再白屏
+- PadMusic 切到后台时保存 Cookie，降低登录状态丢失的可能
+- 封面下载失败时不再显示上一首的封面，并会重试；过大的封面会先缩小
+- 移除不再生效的“记住登录浏览器”逻辑，自动打开登录浏览器统一由菜单的“自动登录”开关控制；补上 Android 11 以上检测 Custom Tabs 浏览器所需的声明
+
+## 1.7.1 稳定性与正式签名
+
+- WebView 渲染进程崩溃或被系统回收时不再闪退，自动重建页面并回到原页面；若 10 秒内再次崩溃则回到首页
+- 后台开始播放时，PadMusic 不再因系统限制启动前台服务而闪退
+- 外部链接收紧：iframe 不再拉起其他 App；只有点击的网页、邮件链接才会离开 App，页面脚本的自动跳转和其他协议一律阻止
+- 含未编码 `|`、`^`、`"` 的 YouTube 链接留在 App 内，不再被误判为外部链接
+- 发布包改为 Release 构建并使用自己的签名。**从旧版升级需要先卸载一次（证书不同），之后要重新登录**
+
 ## 1.7.0 合并 PadMusic（YouTube Music）
 
 - 安装后桌面出现两个图标：「PadTube」看视频，「PadMusic 音乐」听 YouTube Music
@@ -74,9 +109,28 @@ PadTube 是参考仓库根目录的 YouTube Clear 桌面版，为 Android 平板
 .\gradlew.bat test assembleDebug
 ```
 
+## 构建发布包
+
+日常安装用 Release 包：体积约为 Debug 包的十分之一，并且关闭了 WebView 远程调试。
+
+1. 生成一次签名文件（放在项目根目录，已被 git 忽略）：
+
+   ```powershell
+   keytool -genkeypair -v -keystore padtube-release.jks -alias padtube -keyalg RSA -keysize 2048 -validity 10000
+   ```
+
+2. 复制 `keystore.properties.example` 为 `keystore.properties`，填入密码。
+3. 运行下面的命令，APK 输出到 `release/PadTube-<版本号>.apk`：
+
+   ```powershell
+   .\gradlew.bat test archivePadTubeRelease
+   ```
+
+**务必把 `padtube-release.jks` 和密码备份到项目目录以外。** 丢失后已安装的 App 无法覆盖升级，只能卸载重装并重新登录。
+
 ## 安装到 OPPO Pad
 
-1. 把 `app-debug.apk` 传到平板。
+1. 把构建好的 APK 传到平板（Release 包在 `release/`，Debug 包是 `app-debug.apk`）。
 2. 在系统设置中允许当前文件管理器“安装未知应用”。
 3. 点 APK 安装。
 4. 无需账号时直接使用主页；需要订阅、历史和个性化推荐时，点右上角“登录观看”。

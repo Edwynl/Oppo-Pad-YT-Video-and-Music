@@ -13,4 +13,12 @@ class NavigationPolicyTest {
         assertFalse(NavigationPolicy.isAllowed("https://example.com/"))
         assertFalse(NavigationPolicy.isAllowed("intent://music.youtube.com/"))
     }
+
+    @Test
+    fun judgesAlreadyParsedSchemeAndHost() {
+        assertTrue(NavigationPolicy.isAllowed("https", "music.youtube.com"))
+        assertFalse(NavigationPolicy.isAllowed("https", "example.com"))
+        assertFalse(NavigationPolicy.isAllowed("intent", "music.youtube.com"))
+        assertFalse(NavigationPolicy.isAllowed("https", null))
+    }
 }

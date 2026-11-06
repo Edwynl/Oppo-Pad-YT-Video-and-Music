@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
@@ -6,7 +7,12 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-val appVersionName = "1.7.0"
+val appVersionName = "1.7.4"
+
+// Signing secrets live in keystore.properties (git-ignored); see
+// keystore.properties.example. Without it, release builds are left unsigned.
+val keystorePropertiesFile = rootProject.file("keystore.properties")
+val hasReleaseSigning = keystorePropertiesFile.exists()
 
 android {
     namespace = "com.edwyn.padtube"
@@ -16,14 +22,29 @@ android {
         applicationId = "com.edwyn.padtube"
         minSdk = 26
         targetSdk = 36
-        versionCode = 17
+        versionCode = 21
         versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        if (hasReleaseSigning) {
+            val keystoreProperties = Properties().apply {
+                keystorePropertiesFile.inputStream().use(::load)
+            }
+            create("release") {
+                storeFile = rootProject.file(keystoreProperties.getProperty("storeFile"))
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
@@ -53,13 +74,24 @@ android {
     }
 }
 
-tasks.register<Copy>("archivePadTubeDebug") {
+// A separate task: Copy skips itself (doFirst included) when the signed APK is
+// absent, which would make a missing keystore look like a successful build.
+val verifyReleaseSigning = tasks.register("verifyReleaseSigning") {
+    val signingConfigured = hasReleaseSigning
+    doLast {
+        if (!signingConfigured) {
+            throw GradleException("keystore.properties is missing; see keystore.properties.example.")
+        }
+    }
+}
+
+tasks.register<Copy>("archivePadTubeRelease") {
     group = "build"
-    description = "Build the debug APK and archive it into release/ with a versioned filename."
-    dependsOn("assembleDebug")
-    from(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
+    description = "Build the signed release APK and archive it into release/ with a versioned filename."
+    dependsOn(verifyReleaseSigning, "assembleRelease")
+    from(layout.buildDirectory.file("outputs/apk/release/app-release.apk"))
     into(rootProject.layout.projectDirectory.dir("release"))
-    rename("app-debug.apk", "PadTube-$appVersionName.apk")
+    rename("app-release.apk", "PadTube-$appVersionName.apk")
 }
 
 kotlin {

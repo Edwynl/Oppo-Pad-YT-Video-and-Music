@@ -7,6 +7,9 @@ object MusicCleaner {
     val script = """
         (() => {
           'use strict';
+          // Document-start injection also reaches same-origin iframes, which
+          // have no player and would report a false "not playing" state.
+          if (window !== window.top) return;
           const VERSION = '1.2.0';
           if (window.__padMusicVersion === VERSION) {
             window.__padMusicCleanNow?.();
@@ -154,10 +157,17 @@ object MusicCleaner {
               video.addEventListener('pause', () => {
                 if (document.hidden && intendedPlaying && !explicitPause && !adMode) {
                   setTimeout(resumeInBackground, 120);
+                } else if (!document.hidden && !adMode) {
+                  // Paused on the visible page: the user's choice, or the track
+                  // ended. Going to the background must not undo it.
+                  intendedPlaying = false;
                 }
                 setTimeout(notifyAndroid, 150);
               }, { passive: true });
               video.addEventListener('ended', notifyAndroid, { passive: true });
+              video.addEventListener('timeupdate', () => {
+                if (Date.now() - lastPositionAt >= 1000) notifyAndroid();
+              }, { passive: true });
             }
             return video;
           }
@@ -333,6 +343,7 @@ object MusicCleaner {
           };
 
           function cleanNow() {
+            watchPlayer();
             getVideo();
             removeAdUi();
             handleAds();
@@ -354,13 +365,35 @@ object MusicCleaner {
           }
 
           window.__padMusicCleanNow = cleanNow;
+
+          // New elements anywhere (ad renderers, "are you there" dialogs) or
+          // class changes inside the player (ad-showing) trigger a pass; class
+          // changes across the rest of the page do not. Position updates come
+          // from the video's timeupdate event.
           new MutationObserver(scheduleClean).observe(document.documentElement, {
             childList: true,
-            subtree: true,
-            attributes: true,
-            attributeFilter: ['class']
+            subtree: true
           });
-          setInterval(cleanNow, 650);
+          const playerObserver = new MutationObserver(scheduleClean);
+          let watchedPlayer = null;
+          function watchPlayer() {
+            const player = getPlayer();
+            if (!player || player === watchedPlayer) return;
+            watchedPlayer = player;
+            playerObserver.disconnect();
+            playerObserver.observe(player, {
+              attributes: true,
+              attributeFilter: ['class'],
+              subtree: true
+            });
+          }
+
+          // Safety net for anything the observers miss: about every 3s, or
+          // every tick while an ad is being skipped.
+          let ticks = 0;
+          setInterval(() => {
+            if (adMode || ++ticks % 5 === 0) cleanNow();
+          }, 650);
           document.addEventListener('yt-navigate-finish', cleanNow, true);
           cleanNow();
         })();

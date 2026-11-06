@@ -9,11 +9,17 @@ import android.content.res.Configuration
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Rational
+import android.view.InputDevice
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -34,6 +40,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -57,6 +64,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -82,6 +91,8 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.edwyn.padtube.music.PlaybackBridge
+import com.edwyn.padtube.music.PlaybackCommand
 import java.io.ByteArrayInputStream
 import org.json.JSONObject
 
@@ -97,6 +108,21 @@ class MainActivity : ComponentActivity() {
     private var pipMode by mutableStateOf(false)
     private var mediaPlaying = false
     private var playbackServiceStarted = false
+    private var webViewGeneration by mutableIntStateOf(0)
+    private var lastUrl: String? = null
+    private var recoveryUrl: String? = null
+    private var lastRecoveryAt: Long? = null
+    private var lastPageTapAt = 0L
+    private var inForeground = false
+    private val idleHandler = Handler(Looper.getMainLooper())
+    private val stopWhenIdle = Runnable {
+        // A paused video in the PiP window is still in use; closing the window
+        // restarts this timer.
+        if (isInPipMode()) return@Runnable
+        webView?.onPause()
+        PlaybackService.stop(this)
+        playbackServiceStarted = false
+    }
     private val preferences by lazy {
         getSharedPreferences(PREFERENCES_NAME, MODE_PRIVATE)
     }
@@ -121,16 +147,21 @@ class MainActivity : ComponentActivity() {
                     PadTubeScreen(
                         uiState = uiState,
                         showToolbar = !pipMode,
+                        webViewGeneration = webViewGeneration,
                         webViewFactory = { createWebView(savedInstanceState) },
                         onBack = { webView?.goBack() },
                         onForward = { webView?.goForward() },
-                        onHome = { webView?.loadUrl(YOUTUBE_HOME) },
-                        onRefresh = { webView?.reload() },
+                        onHome = {
+                            vm.onRetry()
+                            webView?.loadUrl(YOUTUBE_HOME)
+                        },
+                        onRefresh = {
+                            vm.onRetry()
+                            webView?.reload()
+                        },
                         onToggleDesktop = { toggleDesktopMode() },
                         onLoginMode = { webView?.loadUrl(SIGN_IN_URL) },
-                        onLoginChrome = {
-                            openAuthenticatedMode(YOUTUBE_HOME, rememberForNextLaunch = false)
-                        },
+                        onLoginChrome = { openAuthenticatedMode(YOUTUBE_HOME) },
                         onOpenExternal = { openExternal(webView?.url ?: YOUTUBE_HOME) },
                         onEnterPip = { enterPipIfPossible() },
                         onToggleAutoLogin = { setAutoLoginEnabled(!uiState.autoLogin) },
@@ -155,7 +186,7 @@ class MainActivity : ComponentActivity() {
         if (preferences.getBoolean(PREFERENCE_AUTO_LOGIN, false)) {
             root.post {
                 if (!isFinishing && !isDestroyed) {
-                    openAuthenticatedMode(YOUTUBE_HOME, rememberForNextLaunch = false)
+                    openAuthenticatedMode(YOUTUBE_HOME)
                 }
             }
         }
@@ -167,6 +198,8 @@ class MainActivity : ComponentActivity() {
                 when {
                     customView != null -> exitFullscreen()
                     webView?.canGoBack() == true -> webView?.goBack()
+                    // finish() would stop playback; keep it running in the background.
+                    mediaPlaying -> moveTaskToBack(true)
                     else -> finish()
                 }
             }
@@ -249,6 +282,13 @@ class MainActivity : ComponentActivity() {
                     onMediaState(message.data ?: return@addWebMessageListener)
                 }
                 WebViewCompat.addDocumentStartJavaScript(this, MediaBridge.reportScript, YOUTUBE_ORIGINS)
+                WebViewCompat.addWebMessageListener(
+                    this,
+                    NativeTap.LISTENER_NAME,
+                    YOUTUBE_ORIGINS
+                ) { _, message, _, _, _ ->
+                    tapPage(message.data ?: return@addWebMessageListener)
+                }
             }
 
             CookieManager.getInstance().apply {
@@ -265,8 +305,28 @@ class MainActivity : ComponentActivity() {
                     val uri = request.url
                     // In-WebView sign-in: accounts.google.com is an allowed host,
                     // so let the sign-in flow load here instead of punting to Chrome.
-                    if (NavigationPolicy.isAllowed(uri.toString())) return false
-                    openExternal(uri.toString())
+                    val action = ExternalLinkPolicy.actionFor(
+                        scheme = uri.scheme,
+                        allowedHost = NavigationPolicy.isAllowed(uri.scheme, uri.host),
+                        isMainFrame = request.isForMainFrame,
+                        hasGesture = request.hasGesture(),
+                        isRedirect = request.isRedirect
+                    )
+                    when (action) {
+                        LinkAction.STAY_IN_APP -> return false
+                        LinkAction.OPEN_EXTERNALLY -> openExternal(uri.toString())
+                        LinkAction.BLOCK -> browserViewModel?.showMessage("已阻止打开此链接")
+                    }
+                    return true
+                }
+
+                // By default a dead renderer takes the whole app down, stopping
+                // any playback; replace just the WebView instead.
+                override fun onRenderProcessGone(
+                    view: WebView,
+                    detail: RenderProcessGoneDetail
+                ): Boolean {
+                    recoverFromRendererGone(view)
                     return true
                 }
 
@@ -286,17 +346,22 @@ class MainActivity : ComponentActivity() {
                 }
 
                 override fun onPageStarted(view: WebView, url: String?, favicon: android.graphics.Bitmap?) {
+                    lastUrl = url ?: lastUrl
+                    browserViewModel?.onNavigationStarted(url)
                     updateBrowserState(view, 0)
                 }
 
                 // YouTube navigates with history.pushState, which fires neither
                 // onPageStarted nor onPageFinished; keep back/forward in sync.
                 override fun doUpdateVisitedHistory(view: WebView, url: String?, isReload: Boolean) {
+                    lastUrl = url ?: lastUrl
                     updateBrowserState(view, view.progress)
                 }
 
                 override fun onPageFinished(view: WebView, url: String?) {
-                    view.evaluateJavascript(YouTubeCleaner.script, null)
+                    if (NavigationPolicy.isYouTubeHost(url?.toUri()?.host)) {
+                        view.evaluateJavascript(YouTubeCleaner.script, null)
+                    }
                     updateBrowserState(view, 100)
                     val loggedIn = CookieManager.getInstance()
                         .getCookie("https://www.youtube.com")
@@ -310,7 +375,7 @@ class MainActivity : ComponentActivity() {
                     error: WebResourceError
                 ) {
                     if (request.isForMainFrame) {
-                        browserViewModel?.onLoadError()
+                        browserViewModel?.onLoadError(request.url.toString())
                     }
                 }
             }
@@ -336,12 +401,36 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            if (savedInstanceState == null) {
-                loadUrl(YOUTUBE_HOME)
-            } else {
-                restoreState(savedInstanceState)
+            val pendingRecovery = recoveryUrl
+            recoveryUrl = null
+            when {
+                pendingRecovery != null -> loadUrl(pendingRecovery)
+                savedInstanceState == null || restoreState(savedInstanceState) == null ->
+                    loadUrl(YOUTUBE_HOME)
             }
         }
+    }
+
+    /**
+     * The dead WebView accepts no further calls: drop it and let Compose build a
+     * new one. Compose is paused while the activity is stopped, so a renderer
+     * killed for memory in the background reloads only when the user returns.
+     */
+    private fun recoverFromRendererGone(deadView: WebView) {
+        val now = SystemClock.elapsedRealtime()
+        recoveryUrl = RendererRecovery.urlAfterCrash(lastUrl, YOUTUBE_HOME, lastRecoveryAt, now)
+        lastRecoveryAt = now
+        exitFullscreen(notifyPage = false)
+        webView = null
+        (deadView.parent as? ViewGroup)?.removeView(deadView)
+        deadView.destroy()
+        mediaPlaying = false
+        updateIdleTimer()
+        if (playbackServiceStarted) {
+            runCatching { PlaybackService.update(this, false, null) }
+        }
+        webViewGeneration++
+        browserViewModel?.showMessage("页面进程已退出，已重新加载")
     }
 
     private fun updateBrowserState(view: WebView, progress: Int) {
@@ -356,7 +445,11 @@ class MainActivity : ComponentActivity() {
     private fun onMediaState(json: String) {
         val state = runCatching { JSONObject(json) }.getOrNull() ?: return
         val playing = state.optBoolean("playing")
+        val wasPlaying = mediaPlaying
         mediaPlaying = playing
+        // The two launcher icons share one speaker: only one plays at a time.
+        if (playing && !wasPlaying) PlaybackBridge.dispatch(PlaybackCommand.PAUSE)
+        if (playing != wasPlaying) updateIdleTimer()
         // Start the service on first playback only; afterwards keep it updated
         // so paused videos can be resumed from the lock screen.
         if (!playing && !playbackServiceStarted) return
@@ -364,6 +457,32 @@ class MainActivity : ComponentActivity() {
             PlaybackService.update(this, playing, state.optString("title"))
             playbackServiceStarted = true
         }
+    }
+
+    /** Left paused in the background for a while: release the notification and WebView. */
+    private fun updateIdleTimer() {
+        idleHandler.removeCallbacks(stopWhenIdle)
+        if (!mediaPlaying && !inForeground) idleHandler.postDelayed(stopWhenIdle, IDLE_STOP_MS)
+    }
+
+    /** A real touch on the page, for the ad skip button that ignores script clicks. */
+    private fun tapPage(message: String) {
+        val fraction = NativeTap.parse(message) ?: return
+        // In fullscreen the player is drawn in the custom view, not the WebView.
+        val view = customView ?: webView ?: return
+        val now = SystemClock.uptimeMillis()
+        if (now - lastPageTapAt < NativeTap.MIN_INTERVAL_MS) return
+        lastPageTapAt = now
+        val (x, y) = NativeTap.pointFor(fraction, view.width, view.height)
+        dispatchTouch(view, now, MotionEvent.ACTION_DOWN, x, y)
+        view.postDelayed({ dispatchTouch(view, now, MotionEvent.ACTION_UP, x, y) }, TAP_DURATION_MS)
+    }
+
+    private fun dispatchTouch(view: View, downTime: Long, action: Int, x: Float, y: Float) {
+        val event = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, x, y, 0)
+        event.source = InputDevice.SOURCE_TOUCHSCREEN
+        view.dispatchTouchEvent(event)
+        event.recycle()
     }
 
     private fun handleMediaCommand(play: Boolean) {
@@ -407,10 +526,7 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun openAuthenticatedMode(
-        url: String,
-        rememberForNextLaunch: Boolean
-    ) {
+    private fun openAuthenticatedMode(url: String) {
         try {
             val customTab = CustomTabsIntent.Builder()
                 .setShowTitle(true)
@@ -420,30 +536,21 @@ class MainActivity : ComponentActivity() {
                 .setNavigationBarColor(Color.rgb(11, 11, 14))
                 .build()
 
-            val savedPackage = preferences.getString(PREFERENCE_BROWSER_PACKAGE, null)
-            val browserPackage = savedPackage ?: CustomTabsClient.getPackageName(this, null)
-            browserPackage?.let(customTab.intent::setPackage)
+            CustomTabsClient.getPackageName(this, null)?.let(customTab.intent::setPackage)
             customTab.launchUrl(this, url.toUri())
-
-            if (rememberForNextLaunch) {
-                preferences.edit {
-                    putBoolean(PREFERENCE_AUTO_LOGIN, true)
-                    putString(PREFERENCE_BROWSER_PACKAGE, browserPackage)
-                }
-                browserViewModel?.setAutoLogin(true)
-                browserViewModel?.showMessage(
-                    "已记住登录模式，下次启动将自动进入（可在右上角菜单关闭）"
-                )
-            }
         } catch (_: ActivityNotFoundException) {
             openExternal(url)
         }
     }
 
     private fun openExternal(url: String) {
+        val intent = Intent(Intent.ACTION_VIEW, url.toUri())
+            .addCategory(Intent.CATEGORY_BROWSABLE)
         try {
-            startActivity(Intent(Intent.ACTION_VIEW, url.toUri()))
+            startActivity(intent)
         } catch (_: ActivityNotFoundException) {
+            browserViewModel?.showMessage("没有找到可打开此链接的应用")
+        } catch (_: SecurityException) {
             browserViewModel?.showMessage("没有找到可打开此链接的应用")
         }
     }
@@ -485,6 +592,7 @@ class MainActivity : ComponentActivity() {
         if (!isInPictureInPictureMode && !lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
             webView?.evaluateJavascript(PAUSE_MEDIA_SCRIPT, null)
         }
+        updateIdleTimer()
     }
 
     private fun enterFullscreen(
@@ -558,13 +666,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun exitFullscreen() {
+    private fun exitFullscreen(notifyPage: Boolean = true) {
         val view = customView ?: return
         webView?.keepScreenOn = false
         root.removeView(view)
         customView = null
         composeView.visibility = View.VISIBLE
-        customViewCallback?.onCustomViewHidden()
+        if (notifyPage) customViewCallback?.onCustomViewHidden()
         customViewCallback = null
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         restoreWindowState()
@@ -613,6 +721,8 @@ class MainActivity : ComponentActivity() {
         if (!isInPipMode() && !mediaPlaying) {
             webView?.onPause()
         }
+        inForeground = false
+        updateIdleTimer()
         super.onPause()
     }
 
@@ -624,12 +734,15 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         webView?.onResume()
+        inForeground = true
+        updateIdleTimer()
     }
 
     private fun isInPipMode(): Boolean =
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode
 
     override fun onDestroy() {
+        idleHandler.removeCallbacks(stopWhenIdle)
         PlaybackService.commandHandler = null
         PlaybackService.stop(this)
         customView?.let(root::removeView)
@@ -652,7 +765,6 @@ class MainActivity : ComponentActivity() {
             "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fwww.youtube.com%2F"
         private const val PREFERENCES_NAME = "padtube_preferences"
         private const val PREFERENCE_AUTO_LOGIN = "auto_login"
-        private const val PREFERENCE_BROWSER_PACKAGE = "login_browser_package"
         private const val PREFERENCE_DESKTOP_MODE = "desktop_mode"
         private const val VIDEO_IS_PORTRAIT_SCRIPT =
             "(() => { const v = document.querySelector('video');" +
@@ -660,6 +772,8 @@ class MainActivity : ComponentActivity() {
         private const val PAUSE_MEDIA_SCRIPT =
             "document.querySelectorAll('video,audio').forEach(m => m.pause());"
         private const val FALLBACK_CHROME_MAJOR = "150"
+        private const val IDLE_STOP_MS = 10 * 60 * 1000L
+        private const val TAP_DURATION_MS = 60L
 
         // Claim the same Chrome major version the installed WebView really runs,
         // so YouTube never serves a "browser not supported" page for a fake,
@@ -691,6 +805,7 @@ private fun PadTubeTheme(content: @Composable () -> Unit) {
 private fun PadTubeScreen(
     uiState: BrowserUiState,
     showToolbar: Boolean,
+    webViewGeneration: Int,
     webViewFactory: () -> WebView,
     onBack: () -> Unit,
     onForward: () -> Unit,
@@ -718,6 +833,7 @@ private fun PadTubeScreen(
             .background(MaterialTheme.colorScheme.background)
             .statusBarsPadding()
             .navigationBarsPadding()
+            .imePadding()
     ) {
         if (showToolbar) Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 3.dp) {
             Column {
@@ -751,10 +867,12 @@ private fun PadTubeScreen(
         }
 
         Box(modifier = Modifier.weight(1f)) {
-            AndroidView(
-                factory = { webViewFactory() },
-                modifier = Modifier.fillMaxSize()
-            )
+            key(webViewGeneration) {
+                AndroidView(
+                    factory = { webViewFactory() },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
 
             // First-load placeholder so the user never stares at a black WebView.
             if (!uiState.firstLoadComplete && !uiState.hasError) {
